@@ -209,9 +209,9 @@ jobs:
             
             echo "🚀 Membakar APK menggunakan Gradle Native..."
             if [ "${{ github.event.inputs.build_type }}" = "debug" ]; then
-              ./gradlew assembleDebug
+              ./gradlew assembleDebug --stacktrace 2>&1
             else
-              ./gradlew assembleRelease
+              ./gradlew assembleRelease --stacktrace 2>&1
             fi
             cd -
           fi
