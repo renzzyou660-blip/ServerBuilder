@@ -12,11 +12,32 @@ on:
       icon_url:
         description: 'Icon Url'
         required: true
+      flutter_version:
+        description: 'Versi Flutter (kosongkan = 3.27.0)'
+        required: false
+        default: '3.27.0'
+      package_name:
+        description: 'Package name (kosongkan = auto dari app_name)'
+        required: false
+        default: 'auto'
+      status_bar_color:
+        description: 'Status bar color hex (kosongkan = transparent)'
+        required: false
+        default: ''
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
     steps:
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
       - name: Setup Java
         uses: actions/setup-java@v4
         with:
@@ -26,24 +47,33 @@ jobs:
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
-          flutter-version: '3.44.0'
+          flutter-version: '${{ github.event.inputs.flutter_version }}'
           channel: stable
           cache: true
 
       - name: Create Flutter Project
         run: |
           APP_NAME="${{ github.event.inputs.app_name }}"
-          PKG=$(echo "$APP_NAME" | tr '[:upper:]' '[:lower:]' | tr ' ' '_' | tr -cd '[:alnum:]_')
+          REQUESTED_PKG="${{ github.event.inputs.package_name }}"
+
+          if [ "$REQUESTED_PKG" != "auto" ] && [ -n "$REQUESTED_PKG" ]; then
+            PKG="$REQUESTED_PKG"
+          else
+            PKG=$(echo "$APP_NAME" | tr '[:upper:]' '[:lower:]' | tr ' ' '_' | tr -cd '[:alnum:]_')
+          fi
+
+          echo "App name: $APP_NAME"
+          echo "Package: $PKG"
+
           flutter create --org com.webapk --project-name "$PKG" myapp
 
-      - name: Add Assets and Dependencies
+      - name: Add Dependencies
         run: |
           cd myapp
           flutter pub add webview_flutter
           flutter pub add flutter_launcher_icons
           flutter pub add connectivity_plus
 
-          # Menambahkan konfigurasi assets ke baris paling bawah untuk menghindari error indentasi YAML
           echo "  assets:" >> pubspec.yaml
           echo "    - assets/icon/" >> pubspec.yaml
 
@@ -51,8 +81,15 @@ jobs:
         run: |
           APP_NAME="${{ github.event.inputs.app_name }}"
           WEB_URL="${{ github.event.inputs.web_url }}"
+          STATUS_COLOR="${{ github.event.inputs.status_bar_color }}"
 
-          cat > myapp/lib/main.dart << 'DART'
+          if [ -z "$STATUS_COLOR" ]; then
+            STATUS_BAR_LINE='statusBarColor: Colors.transparent,'
+          else
+            STATUS_BAR_LINE="statusBarColor: const Color(0xFF${STATUS_COLOR}),"
+          fi
+
+          cat > myapp/lib/main.dart << 'DART_EOF'
           import 'package:flutter/material.dart';
           import 'package:flutter/services.dart';
           import 'package:webview_flutter/webview_flutter.dart';
@@ -62,7 +99,7 @@ jobs:
           void main() {
             WidgetsFlutterBinding.ensureInitialized();
             SystemChrome.setSystemUIOverlayStyle(const SystemUiOverlayStyle(
-              statusBarColor: Colors.transparent,
+              __STATUS_BAR_COLOR__
               statusBarIconBrightness: Brightness.dark,
             ));
             runApp(const MyApp());
@@ -73,7 +110,7 @@ jobs:
             @override
             Widget build(BuildContext context) {
               return MaterialApp(
-                title: r'$APP_NAME',
+                title: '__APP_NAME__',
                 debugShowCheckedModeBanner: false,
                 theme: ThemeData(useMaterial3: true, primarySwatch: Colors.blue),
                 home: const SplashScreen(),
@@ -97,7 +134,7 @@ jobs:
             late Animation<double> _dot1Anim;
             late Animation<double> _dot2Anim;
             late Animation<double> _dot3Anim;
-            
+
             bool _isChecking = false;
             bool _dialogShown = false;
 
@@ -286,7 +323,7 @@ jobs:
                         ),
                         const SizedBox(height: 28),
                         Text(
-                          r'$APP_NAME',
+                          '__APP_NAME__',
                           style: const TextStyle(
                             fontSize: 26,
                             fontWeight: FontWeight.w700,
@@ -338,7 +375,7 @@ jobs:
                     if (error.isForMainFrame == true) _showNoConnectionDialog();
                   },
                 ))
-                ..loadRequest(Uri.parse(r'$WEB_URL'));
+                ..loadRequest(Uri.parse('__WEB_URL__'));
 
               _connectivitySub = _connectivity.onConnectivityChanged.listen((results) {
                 if (results.every((r) => r == ConnectivityResult.none)) {
@@ -409,20 +446,21 @@ jobs:
               );
             }
           }
-          DART
+          DART_EOF
 
-          # Mengubah pembatas slash (/) menjadi pagar (#) agar link HTTP tidak merusak regex sed
-          sed -i "s#r'\$APP_NAME'#'$APP_NAME'#g" myapp/lib/main.dart
-          sed -i "s#r'\$WEB_URL'#'$WEB_URL'#g" myapp/lib/main.dart
+          # Replace placeholders — use # as delimiter to avoid conflict with URLs containing /
+          sed -i "s#__APP_NAME__#$APP_NAME#g" myapp/lib/main.dart
+          sed -i "s#__WEB_URL__#$WEB_URL#g" myapp/lib/main.dart
+          sed -i "s#__STATUS_BAR_COLOR__#$STATUS_BAR_LINE#g" myapp/lib/main.dart
 
       - name: Fix Android Permissions and App Name
         run: |
           APP_NAME="${{ github.event.inputs.app_name }}"
           MANIFEST="myapp/android/app/src/main/AndroidManifest.xml"
-          
-          sed -i '/<manifest xmlns:android/a\    <uses-permission android:name="android.permission.INTERNET"\/>' $MANIFEST
-          sed -i '/<manifest xmlns:android/a\    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"\/>' $MANIFEST
-          sed -i "s/android:label=\"[^\"]*\"/android:label=\"$APP_NAME\"/" $MANIFEST
+
+          sed -i '/<manifest xmlns:android/a\    <uses-permission android:name="android.permission.INTERNET"\/>' "$MANIFEST"
+          sed -i '/<manifest xmlns:android/a\    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"\/>' "$MANIFEST"
+          sed -i "s/android:label=\"[^\"]*\"/android:label=\"$APP_NAME\"/" "$MANIFEST"
 
       - name: Setup Network Security (Allow HTTP)
         run: |
@@ -437,28 +475,64 @@ jobs:
             </base-config>
           </network-security-config>
           EOF
-          
+
           sed -i 's/<application/<application android:networkSecurityConfig="@xml\/network_security_config"/' \
             myapp/android/app/src/main/AndroidManifest.xml
 
       - name: Download and Sanitize Icon
         run: |
           mkdir -p myapp/assets/icon
-          sudo apt-get install -y imagemagick
+          sudo apt-get update -qq && sudo apt-get install -y -qq imagemagick > /dev/null 2>&1
 
-          curl -L \
+          ICON_RAW="myapp/assets/icon/icon_raw"
+          ICON_PNG="myapp/assets/icon/icon.png"
+
+          HTTP_CODE=$(curl -s -o "$ICON_RAW" -w "%{http_code}" \
+            -L \
             -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
             -H "Accept: application/octet-stream" \
-            "${{ github.event.inputs.icon_url }}" \
-            -o myapp/assets/icon/icon_raw
+            "${{ github.event.inputs.icon_url }}")
 
-          # Mengubah gambar menjadi format PNG 1024x1024 yang valid
-          convert myapp/assets/icon/icon_raw \
-            -background transparent \
-            -gravity center \
-            -resize 1024x1024 \
-            -extent 1024x1024 \
-            myapp/assets/icon/icon.png
+          if [ "$HTTP_CODE" -ne 200 ]; then
+            echo "WARNING: Icon download returned HTTP $HTTP_CODE, using default Android icon"
+            rm -f "$ICON_RAW"
+          fi
+
+          if [ -f "$ICON_RAW" ]; then
+            # Detect actual file type and convert to valid PNG
+            FILE_TYPE=$(file -b "$ICON_RAW" | head -1)
+            echo "Icon file type: $FILE_TYPE"
+
+            if ! convert "$ICON_RAW" \
+              -background transparent \
+              -gravity center \
+              -resize 1024x1024 \
+              -extent 1024x1024 \
+              "$ICON_PNG" 2>/dev/null; then
+              echo "WARNING: ImageMagick convert failed, trying with -define options"
+              convert "$ICON_RAW" \
+                -define png:color-type=6 \
+                -background transparent \
+                -gravity center \
+                -resize 1024x1024 \
+                -extent 1024x1024 \
+                "$ICON_PNG" 2>/dev/null || {
+                  echo "WARNING: Icon conversion failed, will use default Android icon"
+                  rm -f "$ICON_RAW" "$ICON_PNG"
+                }
+            fi
+
+            # Verify the output is a valid PNG
+            if [ -f "$ICON_PNG" ]; then
+              if ! file "$ICON_PNG" | grep -q "PNG image data"; then
+                echo "WARNING: Output is not a valid PNG, removing"
+                rm -f "$ICON_PNG"
+              fi
+            fi
+          fi
+
+          # Cleanup raw file
+          rm -f "$ICON_RAW"
 
       - name: Write launcher icons config
         run: |
@@ -473,15 +547,39 @@ jobs:
       - name: Generate Icons
         run: |
           cd myapp
-          dart run flutter_launcher_icons -f flutter_launcher_icons.yaml
+          if [ -f "assets/icon/icon.png" ]; then
+            dart run flutter_launcher_icons -f flutter_launcher_icons.yaml
+          else
+            echo "No icon.png found, skipping icon generation (will use Flutter default)"
+            # Create empty placeholder so assets don't fail
+            mkdir -p assets/icon
+          fi
 
       - name: Build APK
         run: |
           cd myapp
           flutter build apk --release
 
+      - name: Find and Upload APK
+        run: |
+          APK_FOUND=$(find myapp/build/app/outputs -name "*.apk" -type f | head -n 1)
+
+          if [ -z "$APK_FOUND" ]; then
+            # Broader fallback search
+            APK_FOUND=$(find . -name "*.apk" ! -path "*/.gradle/*" -type f | head -n 1)
+          fi
+
+          if [ -z "$APK_FOUND" ]; then
+            echo "ERROR: APK not found after build!"
+            exit 1
+          fi
+
+          echo "APK found: $APK_FOUND"
+          ls -lh "$APK_FOUND"
+
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: web2apk-release
           path: myapp/build/app/outputs/flutter-apk/app-release.apk
+          if-no-files-found: error
