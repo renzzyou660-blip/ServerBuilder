@@ -1,35 +1,39 @@
-name: Build Flutter APK
+name: Universal Build
 
 on:
   workflow_dispatch:
     inputs:
       zip_url:
-        description: "URL download ZIP project Flutter"
+        description: 'URL download ZIP project'
         required: true
-
       tag:
-        description: "Tag build"
+        description: 'Tag build'
         required: true
-
       build_type:
-        description: "debug / release"
+        description: 'debug / release'
         required: true
-        default: "release"
-        
+        default: 'release'
       only_analyze:
-        description: "Hanya jalankan analyze (true/false)"
+        description: 'Hanya jalankan analyze (true/false)'
         required: false
-        default: "false"
+        default: 'false'
+      flutter_version:
+        description: 'Versi Flutter (auto / specific version like 3.24.0)'
+        required: false
+        default: 'auto'
+      java_version:
+        description: 'Versi JDK (auto / 8 / 11 / 17 / 21)'
+        required: false
+        default: 'auto'
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-    
-    steps:
 
+    steps:
       # =========================
       # NODE.JS
       # =========================
@@ -61,10 +65,6 @@ jobs:
           echo "=== File Type ==="
           file project.zip
 
-          echo ""
-          echo "=== First Bytes ==="
-          xxd project.zip | head -2
-
       # =========================
       # EXTRACT ZIP
       # =========================
@@ -73,14 +73,14 @@ jobs:
           echo "=== Validating ZIP ==="
 
           if ! unzip -t project.zip > /dev/null 2>&1; then
-            echo "❌ File bukan ZIP valid!"
+            echo "File bukan ZIP valid!"
             echo ""
             echo "=== Isi file ==="
             cat project.zip
             exit 1
           fi
 
-          echo "✅ ZIP valid"
+          echo "ZIP valid"
 
           echo ""
           echo "=== Extracting ZIP ==="
@@ -91,152 +91,396 @@ jobs:
           find project_raw | head -50
 
           echo ""
-          echo "=== Mengunci Project Dir (Manut Mode) ==="
-          
+          echo "=== Mengunci Project Dir ==="
+
           SUB_DIR_COUNT=$(find project_raw -maxdepth 1 -mindepth 1 -type d | wc -l)
           FILE_COUNT=$(find project_raw -maxdepth 1 -mindepth 1 -type f | wc -l)
-          
+
           if [ "$SUB_DIR_COUNT" -eq 1 ] && [ "$FILE_COUNT" -eq 0 ]; then
             PROJECT_DIR=$(find project_raw -maxdepth 1 -mindepth 1 -type d | head -n 1)
           else
             PROJECT_DIR="project_raw"
           fi
 
-          echo "✅ Project root langsung dikunci di: $PROJECT_DIR"
+          echo "Project root: $PROJECT_DIR"
           echo "PROJECT_DIR=$PROJECT_DIR" >> $GITHUB_ENV
 
       # =========================
-      # JAVA
+      # DETECT PROJECT TYPE
+      # =========================
+      - name: Detect Project Type
+        id: detect_type
+        run: |
+          DIR="${{ env.PROJECT_DIR }}"
+          PROJECT_TYPE="unknown"
+
+          # Flutter: pubspec.yaml exists
+          if [ -f "$DIR/pubspec.yaml" ]; then
+            if grep -q "flutter:" "$DIR/pubspec.yaml" || grep -q "sdk: flutter" "$DIR/pubspec.yaml"; then
+              PROJECT_TYPE="flutter"
+            fi
+          fi
+
+          # React Native: package.json with react-native dependency
+          if [ "$PROJECT_TYPE" = "unknown" ] && [ -f "$DIR/package.json" ]; then
+            if grep -q "react-native" "$DIR/package.json"; then
+              PROJECT_TYPE="react-native"
+            fi
+          fi
+
+          # Native Android: build.gradle at root (not inside a Flutter project)
+          if [ "$PROJECT_TYPE" = "unknown" ]; then
+            if find "$DIR" -maxdepth 2 \( -name "build.gradle" -o -name "build.gradle.kts" \) ! -path "*/.gradle/*" | grep -q .; then
+              PROJECT_TYPE="android-native"
+            fi
+          fi
+
+          # Cordova/Capacitor: config.xml
+          if [ "$PROJECT_TYPE" = "unknown" ] && [ -f "$DIR/config.xml" ]; then
+            if grep -q "widget" "$DIR/config.xml"; then
+              PROJECT_TYPE="cordova"
+            fi
+          fi
+
+          echo "project_type=$PROJECT_TYPE" >> $GITHUB_OUTPUT
+          echo "Detected project type: $PROJECT_TYPE"
+
+      # =========================
+      # DETECT FLUTTER VERSION
+      # =========================
+      - name: Detect Flutter version
+        id: detect_flutter
+        if: steps.detect_type.outputs.project_type == 'flutter'
+        run: |
+          DIR="${{ env.PROJECT_DIR }}"
+          REQUESTED="${{ github.event.inputs.flutter_version }}"
+
+          if [ "$REQUESTED" != "auto" ] && [ -n "$REQUESTED" ]; then
+            echo "flutter_ver=$REQUESTED" >> $GITHUB_OUTPUT
+            echo "Using requested Flutter version: $REQUESTED"
+            exit 0
+          fi
+
+          # Try to detect from pubspec.yaml SDK constraints
+          DETECTED=""
+          if [ -f "$DIR/pubspec.yaml" ]; then
+            SDK_LINE=$(grep -A2 "sdk:" "$DIR/pubspec.yaml" | grep "flutter" || true)
+            if [ -n "$SDK_LINE" ]; then
+              MIN_VER=$(echo "$SDK_LINE" | grep -oP '>=\s*\K\d+\.\d+' | head -1)
+              if [ -n "$MIN_VER" ]; then
+                MAJOR=$(echo "$MIN_VER" | cut -d. -f1)
+                MINOR=$(echo "$MIN_VER" | cut -d. -f2)
+                echo "SDK constraint requires Flutter >= $MIN_VER"
+                # Map to a reasonable stable version
+                if [ "$MAJOR" -ge 3 ] && [ "$MINOR" -ge 27 ]; then
+                  DETECTED="3.27.0"
+                elif [ "$MAJOR" -ge 3 ] && [ "$MINOR" -ge 24 ]; then
+                  DETECTED="3.24.0"
+                elif [ "$MAJOR" -ge 3 ] && [ "$MINOR" -ge 19 ]; then
+                  DETECTED="3.19.0"
+                elif [ "$MAJOR" -ge 3 ]; then
+                  DETECTED="3.10.0"
+                else
+                  DETECTED="3.27.0"
+                fi
+              fi
+            fi
+          fi
+
+          if [ -z "$DETECTED" ]; then
+            DETECTED="3.27.0"
+          fi
+
+          echo "flutter_ver=$DETECTED" >> $GITHUB_OUTPUT
+          echo "Detected Flutter version: $DETECTED"
+
+      # =========================
+      # DETECT JDK VERSION (for Android-based projects)
+      # =========================
+      - name: Detect JDK version
+        id: detect_jdk
+        run: |
+          DIR="${{ env.PROJECT_DIR }}"
+          PROJECT_TYPE="${{ steps.detect_type.outputs.project_type }}"
+          REQUESTED="${{ github.event.inputs.java_version }}"
+          JDK="17"
+
+          if [ "$REQUESTED" != "auto" ] && [ -n "$REQUESTED" ]; then
+            JDK="$REQUESTED"
+          elif [ "$PROJECT_TYPE" = "android-native" ] || [ "$PROJECT_TYPE" = "react-native" ] || [ "$PROJECT_TYPE" = "cordova" ]; then
+            # Check for AGP version
+            AGP_VER=""
+            for f in "$DIR"/build.gradle "$DIR"/build.gradle.kts "$DIR"/android/build.gradle "$DIR"/android/build.gradle.kts; do
+              if [ -f "$f" ]; then
+                MATCHED=$(grep -oP 'com\.android\.tools\.build:gradle:\K\d+\.\d+\.\d+' "$f" 2>/dev/null | head -1)
+                if [ -n "$MATCHED" ]; then AGP_VER="$MATCHED"; break; fi
+                MATCHED=$(grep -oP '(?:agp|agp_version)\s*=?\s*["\x27]?\K\d+\.\d+\.\d+' "$f" 2>/dev/null | head -1)
+                if [ -n "$MATCHED" ]; then AGP_VER="$MATCHED"; break; fi
+              fi
+            done
+
+            # Check version catalog
+            if [ -z "$AGP_VER" ]; then
+              TOML=$(find "$DIR" -name "libs.versions.toml" 2>/dev/null | head -1)
+              if [ -n "$TOML" ]; then
+                AGP_VER=$(grep -oP 'agp\s*=\s*["\x27]?\K\d+\.\d+\.\d+' "$TOML" 2>/dev/null | head -1)
+              fi
+            fi
+
+            if [ -n "$AGP_VER" ]; then
+              AGP_MAJOR=$(echo "$AGP_VER" | cut -d. -f1)
+              AGP_MINOR=$(echo "$AGP_VER" | cut -d. -f2)
+              if [ "$AGP_MAJOR" -ge 8 ] || { [ "$AGP_MAJOR" -eq 7 ] && [ "$AGP_MINOR" -ge 3 ]; }; then
+                JDK="17"
+              elif [ "$AGP_MAJOR" -ge 4 ]; then
+                JDK="11"
+              fi
+            fi
+          fi
+
+          echo "jdk=$JDK" >> $GITHUB_OUTPUT
+          echo "Selected JDK: $JDK"
+
+      # =========================
+      # SETUP JAVA
       # =========================
       - name: Setup Java
         uses: actions/setup-java@v4
         with:
-          distribution: "temurin"
-          java-version: "17"
+          distribution: 'temurin'
+          java-version: '${{ steps.detect_jdk.outputs.jdk }}'
 
       # =========================
-      # FLUTTER
+      # SETUP FLUTTER (if needed)
       # =========================
       - name: Setup Flutter
-        uses: subosito/flutter-action@main
+        if: steps.detect_type.outputs.project_type == 'flutter'
+        uses: subosito/flutter-action@v2
         with:
-          flutter-version: "3.41.9"
-          channel: "stable"
+          flutter-version: '${{ steps.detect_flutter.outputs.flutter_ver }}'
+          channel: 'stable'
           cache: true
 
       # ==========================================================
-      # 🔍 TAHAP ANALYZE — STEP 1: Jalankan & cetak hasil
-      # (Dipisah dari exit 1 biar log tidak ter-truncate)
+      # ANALYZE — Flutter projects
       # ==========================================================
-      - name: Analyze Project Code
+      - name: Analyze Project Code (Flutter)
+        if: steps.detect_type.outputs.project_type == 'flutter'
         working-directory: ${{ env.PROJECT_DIR }}
         run: |
           echo "=== Starting Automated Code Analysis ==="
-
-          if [ -f "pubspec.yaml" ]; then
-            echo "🔍 Menjalankan linting via flutter analyze..."
-
-            flutter analyze > analyze_report.txt 2>&1 || true
-
-            echo "[RESULT_ANALYZE]"
-            cat analyze_report.txt
-            echo "[END_RESULT_ANALYZE]"
-
-            rm -f analyze_report.txt
-
-          else
-            echo "☕ Project native / gradlew terdeteksi!"
-            echo "[RESULT_ANALYZE]"
-            echo "❌ Fitur analyze hanya support project Flutter (pubspec.yaml tidak ditemukan)."
-            echo "[END_RESULT_ANALYZE]"
-          fi
+          echo "[RESULT_ANALYZE]"
+          flutter analyze 2>&1 || true
+          echo "[END_RESULT_ANALYZE]"
 
       # ==========================================================
-      # 🔍 TAHAP ANALYZE — STEP 2: Stop workflow jika only_analyze
-      # (Dipisah biar log step di atas sudah ter-commit ke GitHub)
+      # ANALYZE — Android Native projects
+      # ==========================================================
+      - name: Analyze Project Code (Android Native)
+        if: steps.detect_type.outputs.project_type == 'android-native'
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          echo "=== Starting Automated Code Analysis ==="
+          ROOT_DIR="${{ env.PROJECT_DIR }}"
+          if [ -f "$ROOT_DIR/gradlew" ]; then
+            GRADLE_CMD="./gradlew"
+          else
+            GRADLE_CMD="gradle"
+          fi
+          echo "[RESULT_ANALYZE]"
+          $GRADLE_CMD lint --no-daemon 2>&1 || echo "Lint task not available, skipping."
+          echo "[END_RESULT_ANALYZE]"
+
+      # ==========================================================
+      # STOP if ANALYZE ONLY
       # ==========================================================
       - name: Stop if Analyze Only
-        if: ${{ github.event.inputs.only_analyze == 'true' }}
+        if: github.event.inputs.only_analyze == 'true'
         run: |
           echo "Analyze-only mode aktif. Workflow dihentikan di sini."
           exit 1
 
-      # =========================
-      # FLUTTER DOCTOR
-      # =========================
-      - name: Flutter Doctor
-        run: flutter doctor
-
       # ==========================================================
-      # 📦 TAHAP DOWNLOAD DEPENDENSI (PUB GET)
+      # BUILD — FLUTTER
       # ==========================================================
-      - name: Get dependencies
+      - name: Build APK (Flutter)
+        if: steps.detect_type.outputs.project_type == 'flutter'
         working-directory: ${{ env.PROJECT_DIR }}
         run: |
-          echo "=== Running flutter pub get ==="
+          echo "=== Building Flutter APK ==="
+          echo "Mode: ${{ github.event.inputs.build_type }}"
+          echo "Flutter version: ${{ steps.detect_flutter.outputs.flutter_ver }}"
+
+          flutter doctor -v
+
           if [ -f "pubspec.yaml" ]; then
-            timeout 120s flutter pub get || echo "⚠️ Gagal download package karena network server, coba lanjut aja..."
+            timeout 120s flutter pub get || echo "Gagal download package, coba lanjut aja..."
+          fi
+
+          flutter build apk --${{ github.event.inputs.build_type }}
+
+      # ==========================================================
+      # BUILD — ANDROID NATIVE
+      # ==========================================================
+      - name: Build APK (Android Native)
+        if: steps.detect_type.outputs.project_type == 'android-native'
+        run: |
+          echo "=== Building Android Native APK ==="
+          DIR="${{ env.PROJECT_DIR }}"
+          BUILD_TYPE="${{ github.event.inputs.build_type }}"
+
+          # Find project root (root-level build.gradle, not app-level)
+          ROOT=$(find "$DIR" -maxdepth 4 \( -name "build.gradle" -o -name "build.gradle.kts" \) ! -path "*/app/*" ! -path "*/.gradle/*" ! -path "*/build/*" | head -1 | xargs dirname 2>/dev/null || echo "")
+          if [ -z "$ROOT" ]; then
+            SETTINGS=$(find "$DIR" -maxdepth 3 \( -name "settings.gradle" -o -name "settings.gradle.kts" \) ! -path "*/.gradle/*" | head -1 | xargs dirname 2>/dev/null || echo "")
+            ROOT="${SETTINGS:-$DIR}"
+          fi
+
+          cd "$ROOT"
+
+          if [ -f "gradlew" ]; then
+            GRADLE_CMD="./gradlew"
+            chmod +x gradlew
           else
-            echo "☕ Bukan project Flutter standar, skip pub get!"
+            GRADLE_CMD="gradle"
+          fi
+
+          if [ "$BUILD_TYPE" = "debug" ]; then
+            $GRADLE_CMD assembleDebug --no-daemon --stacktrace
+          else
+            $GRADLE_CMD assembleRelease --no-daemon --stacktrace
           fi
 
       # ==========================================================
-      # 🚀 TAHAP PEMBAKARAN UTAMA (BUILD APK)
+      # BUILD — REACT NATIVE
       # ==========================================================
-      - name: Build APK
-        working-directory: ${{ env.PROJECT_DIR }}
+      - name: Build APK (React Native)
+        if: steps.detect_type.outputs.project_type == 'react-native'
         run: |
-          echo "=== Building APK ==="
-          echo "Mode: ${{ github.event.inputs.build_type }}"
+          echo "=== Building React Native APK ==="
+          DIR="${{ env.PROJECT_DIR }}"
+          BUILD_TYPE="${{ github.event.inputs.build_type }}"
 
-          if [ -f "pubspec.yaml" ]; then
-            echo "🔥 Project Flutter Terdeteksi! Kompilasi via Flutter SDK..."
-            flutter build apk --${{ github.event.inputs.build_type }}
-            
+          cd "$DIR"
+
+          # Install dependencies
+          npm install --legacy-peer-deps 2>&1 || yarn install 2>&1 || echo "Package install had warnings, continuing..."
+
+          # Setup Android directory
+          if [ ! -d "android" ]; then
+            echo "ERROR: No android directory found in React Native project!"
+            exit 1
+          fi
+
+          cd android
+
+          # Detect and setup local properties
+          if [ ! -f "local.properties" ]; then
+            echo "sdk.dir=$ANDROID_HOME" > local.properties
+          fi
+
+          if [ -f "gradlew" ]; then
+            GRADLE_CMD="./gradlew"
+            chmod +x gradlew
           else
-            echo "☕ Project Native Android Terdeteksi! Bypassing Flutter Core..."
-            GRADLE_PATH=$(find . -name "gradlew" | head -n 1)
-            
-            if [ -z "$GRADLE_PATH" ]; then
-              echo "❌ ERROR: File 'gradlew' tidak ditemukan!"
-              echo "FAILURE: Build failed with an exception"
-              exit 1
-            fi
-            
-            GRADLE_DIR=$(dirname "$GRADLE_PATH")
+            GRADLE_CMD="gradle"
+          fi
+
+          if [ "$BUILD_TYPE" = "debug" ]; then
+            $GRADLE_CMD assembleDebug --no-daemon --stacktrace
+          else
+            $GRADLE_CMD assembleRelease --no-daemon --stacktrace
+          fi
+
+      # ==========================================================
+      # BUILD — CORDOVA
+      # ==========================================================
+      - name: Build APK (Cordova)
+        if: steps.detect_type.outputs.project_type == 'cordova'
+        run: |
+          echo "=== Building Cordova APK ==="
+          DIR="${{ env.PROJECT_DIR }}"
+          BUILD_TYPE="${{ github.event.inputs.build_type }}"
+
+          cd "$DIR"
+
+          # Install Cordova
+          npm install -g cordova
+
+          # Install platform if not present
+          if [ ! -d "platforms/android" ]; then
+            cordova platform add android
+          fi
+
+          # Install plugins
+          cordova plugin restore 2>/dev/null || true
+
+          if [ "$BUILD_TYPE" = "debug" ]; then
+            cordova build android --debug
+          else
+            cordova build android --release
+          fi
+
+      # ==========================================================
+      # FALLBACK — UNKNOWN PROJECT TYPE
+      # ==========================================================
+      - name: Build APK (Fallback — Auto-detect)
+        if: steps.detect_type.outputs.project_type == 'unknown'
+        run: |
+          echo "=== Unknown project type, attempting auto-detect build ==="
+          DIR="${{ env.PROJECT_DIR }}"
+          BUILD_TYPE="${{ github.event.inputs.build_type }}"
+
+          # Strategy 1: Try Gradle
+          GRADLE_ROOT=$(find "$DIR" -maxdepth 4 -name "gradlew" -type f | head -1)
+          if [ -n "$GRADLE_ROOT" ]; then
+            GRADLE_DIR=$(dirname "$GRADLE_ROOT")
+            echo "Found gradlew at: $GRADLE_DIR"
             cd "$GRADLE_DIR"
             chmod +x gradlew
-            
-            echo "🚀 Membakar APK menggunakan Gradle Native..."
-            if [ "${{ github.event.inputs.build_type }}" = "debug" ]; then
-              ./gradlew assembleDebug --stacktrace 2>&1
+            if [ "$BUILD_TYPE" = "debug" ]; then
+              ./gradlew assembleDebug --no-daemon --stacktrace
             else
-              ./gradlew assembleRelease --stacktrace 2>&1
+              ./gradlew assembleRelease --no-daemon --stacktrace
             fi
-            cd -
+            exit 0
           fi
 
+          # Strategy 2: Try Flutter
+          if [ -f "$DIR/pubspec.yaml" ]; then
+            echo "Found pubspec.yaml, trying Flutter build..."
+            cd "$DIR"
+            flutter pub get || true
+            flutter build apk --${{ github.event.inputs.build_type }}
+            exit 0
+          fi
+
+          echo "ERROR: Cannot determine build system for this project!"
+          echo "Supported: Flutter, Android Native (Gradle), React Native, Cordova"
+          exit 1
+
       # =========================
-      # CHECK APK
+      # FIND & UPLOAD APK
       # =========================
-      - name: Check APK Output
+      - name: Find APK Output
+        id: find_apk
         run: |
           echo "=== APK Output Scanning (Global Mode) ==="
 
-          echo "Mencari file APK di seluruh direktori..."
-          find $GITHUB_WORKSPACE -name "*.apk"
-
-          APK_FOUND=$(find $GITHUB_WORKSPACE -name "*.apk" | head -n 1)
+          APK_FOUND=$(find $GITHUB_WORKSPACE -name "*.apk" \
+            ! -path "*/.gradle/*" \
+            ! -path "*/build/intermediates/*" \
+            ! -path "*/build/tmp/*" \
+            -type f | head -n 1)
 
           if [ -z "$APK_FOUND" ]; then
-            echo "Error: Berkas biner APK beneran gak dicetak sama sekali oleh compiler."
+            echo "ERROR: APK file not found after build!"
             exit 1
           fi
 
           APK_PATH=$(echo "$APK_FOUND" | sed "s|$GITHUB_WORKSPACE/||")
 
-          echo "✅ APK Sukses Ditemukan di Jalur: $APK_PATH"
-          
+          echo "APK found: $APK_PATH"
           echo "PROJECT_DIR=$GITHUB_WORKSPACE" >> $GITHUB_ENV
           echo "APK_PATH=$APK_PATH" >> $GITHUB_ENV
 
@@ -244,13 +488,10 @@ jobs:
           echo "=== APK Size ==="
           ls -lh "$APK_FOUND"
 
-      # =========================
-      # UPLOAD APK
-      # =========================
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: flutter-${{ github.event.inputs.build_type }}-${{ github.event.inputs.tag }}
+          name: build-${{ github.event.inputs.build_type }}-${{ github.event.inputs.tag }}
           path: ${{ env.PROJECT_DIR }}/${{ env.APK_PATH }}
           retention-days: 1
           if-no-files-found: error
