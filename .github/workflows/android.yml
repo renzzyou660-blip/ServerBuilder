@@ -1,4 +1,4 @@
-name: Build Android APK
+name: Build Android Studio APK
 
 on:
   workflow_dispatch:
@@ -10,20 +10,22 @@ on:
         description: 'Tag untuk release'
         required: true
       build_type:
-        description: 'Tipe build: debug, release, atau custom task name'
+        description: 'Tipe build: debug atau release'
         required: true
         default: 'release'
-      java_version:
-        description: 'Versi JDK (auto / 8 / 11 / 17 / 21)'
-        required: false
-        default: 'auto'
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 30
 
     steps:
+      - name: Setup JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
       - name: Download ZIP project
         run: |
           curl -L \
@@ -42,14 +44,10 @@ jobs:
       - name: Find project root
         id: find_root
         run: |
-          # Find the directory that contains build.gradle or build.gradle.kts (project-level, not app-level)
-          ROOT=$(find project_src -maxdepth 4 \( -name "build.gradle" -o -name "build.gradle.kts" \) ! -path "*/app/*" ! -path "*/.gradle/*" ! -path "*/build/*" | head -1 | xargs dirname 2>/dev/null || echo "")
+          # Find the directory that contains build.gradle or build.gradle.kts
+          ROOT=$(find project_src -maxdepth 3 \( -name "build.gradle" -o -name "build.gradle.kts" \) ! -path "*/app/*" | head -1 | xargs dirname 2>/dev/null || echo "")
           if [ -z "$ROOT" ]; then
-            # Fallback: check for settings.gradle as root indicator
-            ROOT=$(find project_src -maxdepth 3 \( -name "settings.gradle" -o -name "settings.gradle.kts" \) ! -path "*/.gradle/*" | head -1 | xargs dirname 2>/dev/null || echo "")
-          fi
-          if [ -z "$ROOT" ]; then
-            # Last fallback: use the first subdirectory if zip extracted into a folder
+            # Fallback: use the first subdirectory if zip extracted into a folder
             FIRST=$(ls -d project_src/*/ 2>/dev/null | head -1)
             ROOT="${FIRST:-project_src}"
           fi
@@ -57,121 +55,19 @@ jobs:
           echo "root=$ROOT" >> $GITHUB_OUTPUT
           ls -la "$ROOT/"
 
-      - name: Detect JDK, Gradle, and AGP version
-        id: detect
-        run: |
-          ROOT="${{ steps.find_root.outputs.root }}"
-          AGP_VER=""
-          GRADLE_VER=""
-          REQUESTED_JDK="${{ github.event.inputs.java_version }}"
-
-          # --- Detect Gradle version from wrapper properties ---
-          WRAPPER_PROPS="$ROOT/gradle/wrapper/gradle-wrapper.properties"
-          if [ -f "$WRAPPER_PROPS" ]; then
-            GRADLE_VER=$(grep -oP 'gradle-\K\d+\.\d+(\.\d+)?' "$WRAPPER_PROPS" | head -1)
-            echo "Detected Gradle version: $GRADLE_VER"
-          fi
-
-          # --- Detect AGP version from build files ---
-          for f in "$ROOT"/build.gradle "$ROOT"/build.gradle.kts; do
-            if [ -f "$f" ]; then
-              # Pattern: com.android.application version "x.y.z" or com.android.application:version
-              MATCHED=$(grep -oP 'com\.android\.(application|library|dynamic-feature)[^)]*?(\d+\.\d+\.\d+)' "$f" 2>/dev/null | grep -oP '\d+\.\d+\.\d+' | head -1)
-              if [ -n "$MATCHED" ]; then AGP_VER="$MATCHED"; break; fi
-              # Pattern: agp = "x.y.z" or agp_version = "x.y.z"
-              MATCHED=$(grep -oP '(?:agp|agp_version|androidGradlePluginVersion)\s*=?\s*["\x27]?\K\d+\.\d+\.\d+' "$f" 2>/dev/null | head -1)
-              if [ -n "$MATCHED" ]; then AGP_VER="$MATCHED"; break; fi
-              # Pattern: classpath "com.android.tools.build:gradle:x.y.z"
-              MATCHED=$(grep -oP 'com\.android\.tools\.build:gradle:\K\d+\.\d+\.\d+' "$f" 2>/dev/null | head -1)
-              if [ -n "$MATCHED" ]; then AGP_VER="$MATCHED"; break; fi
-            fi
-          done
-
-          # Also check app-level build file for version catalog refs
-          APP_BUILD=$(find "$ROOT/app" -maxdepth 1 \( -name "build.gradle" -o -name "build.gradle.kts" \) 2>/dev/null | head -1)
-          if [ -z "$AGP_VER" ] && [ -n "$APP_BUILD" ]; then
-            # Check version catalog (libs.versions.toml)
-            TOML=$(find "$ROOT" -name "libs.versions.toml" 2>/dev/null | head -1)
-            if [ -n "$TOML" ]; then
-              MATCHED=$(grep -oP 'agp\s*=\s*["\x27]?\K\d+\.\d+\.\d+' "$TOML" 2>/dev/null | head -1)
-              if [ -n "$MATCHED" ]; then AGP_VER="$MATCHED"; fi
-            fi
-          fi
-
-          echo "Detected AGP version: $AGP_VER"
-
-          # --- Determine JDK version ---
-          if [ "$REQUESTED_JDK" != "auto" ] && [ -n "$REQUESTED_JDK" ]; then
-            JDK="$REQUESTED_JDK"
-          elif [ -n "$AGP_VER" ]; then
-            AGP_MAJOR=$(echo "$AGP_VER" | cut -d. -f1)
-            AGP_MINOR=$(echo "$AGP_VER" | cut -d. -f2)
-            if [ "$AGP_MAJOR" -ge 8 ] || { [ "$AGP_MAJOR" -eq 7 ] && [ "$AGP_MINOR" -ge 3 ]; }; then
-              JDK="17"
-            elif [ "$AGP_MAJOR" -eq 7 ] && [ "$AGP_MINOR" -ge 2 ]; then
-              JDK="17"
-            elif [ "$AGP_MAJOR" -ge 4 ]; then
-              JDK="11"
-            else
-              JDK="11"
-            fi
-          elif [ -n "$GRADLE_VER" ]; then
-            G_MAJOR=$(echo "$GRADLE_VER" | cut -d. -f1)
-            if [ "$G_MAJOR" -ge 8 ]; then
-              JDK="17"
-            elif [ "$G_MAJOR" -ge 7 ]; then
-              JDK="17"
-            else
-              JDK="11"
-            fi
-          else
-            JDK="17"
-          fi
-
-          echo "Selected JDK: $JDK"
-          echo "jdk=$JDK" >> $GITHUB_OUTPUT
-
-          # --- Check if NDK is needed ---
-          if grep -rq "externalNativeBuild" "$ROOT/app/build.gradle" "$ROOT/app/build.gradle.kts" "$ROOT/build.gradle" "$ROOT/build.gradle.kts" 2>/dev/null; then
-            echo "ndk_needed=true" >> $GITHUB_OUTPUT
-          else
-            echo "ndk_needed=false" >> $GITHUB_OUTPUT
-          fi
-
-          # --- Check for Kotlin ---
-          if [ -f "$ROOT/build.gradle.kts" ] || grep -rq "kotlin-android" "$ROOT/app/build.gradle" "$ROOT/app/build.gradle.kts" 2>/dev/null; then
-            echo "kotlin=true" >> $GITHUB_OUTPUT
-          else
-            echo "kotlin=false" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Setup JDK ${{ steps.detect.outputs.jdk }}
-        uses: actions/setup-java@v4
-        with:
-          java-version: '${{ steps.detect.outputs.jdk }}'
-          distribution: 'temurin'
-
-      - name: Setup Android SDK (NDK)
-        if: steps.detect.outputs.ndk_needed == 'true'
-        uses: android-actions/setup-android@v3
-
       - name: Grant gradlew permission
         run: |
           ROOT="${{ steps.find_root.outputs.root }}"
           if [ -f "$ROOT/gradlew" ]; then
             chmod +x "$ROOT/gradlew"
-            echo "gradlew found and made executable"
           else
-            echo "gradlew not found, will use system gradle"
+            echo "gradlew not found, will use gradle wrapper download"
           fi
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: wrapper
 
-      - name: Resolve build task
-        id: resolve_task
+      - name: Build APK (${{ github.event.inputs.build_type }})
         run: |
           ROOT="${{ steps.find_root.outputs.root }}"
           cd "$ROOT"
@@ -183,55 +79,27 @@ jobs:
             GRADLE_CMD="gradle"
           fi
 
-          echo "gradle_cmd=$GRADLE_CMD" >> $GITHUB_OUTPUT
-
-          # If build_type is a custom task name (not debug/release), use it directly
-          if [ "$BUILD_TYPE" != "debug" ] && [ "$BUILD_TYPE" != "release" ]; then
-            echo "build_task=$BUILD_TYPE" >> $GITHUB_OUTPUT
-            echo "Using custom build task: $BUILD_TYPE"
-            exit 0
-          fi
-
-          # Map build_type to assemble task
           if [ "$BUILD_TYPE" = "debug" ]; then
-            BUILD_TASK="assembleDebug"
+            $GRADLE_CMD assembleDebug --no-daemon --stacktrace
           else
-            BUILD_TASK="assembleRelease"
+            $GRADLE_CMD assembleRelease --no-daemon --stacktrace
           fi
-
-          echo "build_task=$BUILD_TASK" >> $GITHUB_OUTPUT
-          echo "Resolved build task: $BUILD_TASK"
-
-      - name: Build APK
-        run: |
-          ROOT="${{ steps.find_root.outputs.root }}"
-          cd "$ROOT"
-          ${{ steps.resolve_task.outputs.gradle_cmd }} ${{ steps.resolve_task.outputs.build_task }} --no-daemon --stacktrace
 
       - name: Find APK output
         id: find_apk
         run: |
           ROOT="${{ steps.find_root.outputs.root }}"
           BUILD_TYPE="${{ github.event.inputs.build_type }}"
-
-          # Search for APK, excluding intermediate/build cache directories
-          APK=$(find "$ROOT" -name "*.apk" \
-            ! -path "*/.gradle/*" \
-            ! -path "*/build/intermediates/*" \
-            ! -path "*/build/tmp/*" \
-            -type f | head -1)
-
-          if [ -z "$APK" ]; then
-            echo "ERROR: No APK file found after build!"
-            exit 1
+          if [ "$BUILD_TYPE" = "debug" ]; then
+            APK=$(find "$ROOT" -name "*debug*.apk" | head -1)
+          else
+            APK=$(find "$ROOT" -name "*release*.apk" | head -1)
           fi
-
+          if [ -z "$APK" ]; then
+            APK=$(find "$ROOT" -name "*.apk" | head -1)
+          fi
           echo "APK found: $APK"
           echo "apk_path=$APK" >> $GITHUB_OUTPUT
-
-          # Print APK info
-          ls -lh "$APK"
-          file "$APK"
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
